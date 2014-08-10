@@ -1,0 +1,36 @@
+Macros can be used to create reusable chunks of vroom code
+
+  @macro (insert and verify first line)
+  % inserting line1 from macro<cr>
+  % inserting line2 from macro<cr>
+  inserting line1 from macro
+  @endmacro
+
+Text defined between the @macro/@endmacro directives isn't parsed as vroom
+code, so the buffer is still empty:
+
+  &
+  @end
+
+Instead, the text is stored by the parser and pasted when a `@do` directive is
+is found :
+
+  @do (insert and verify first line)
+  inserting line2 from macro
+
+
+
+It still works on a new test, since macros are defined on the file scope:
+
+  @do (insert and verify first line)
+  @do (insert and verify first line)
+  @do (insert and verify first line)
+
+  inserting line1 from macro
+  inserting line2 from macro
+  inserting line1 from macro
+  inserting line2 from macro
+  inserting line1 from macro
+  inserting line2 from macro
+  &
+  @end

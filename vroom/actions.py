@@ -1,3 +1,5 @@
+import collections
+
 """Vroom action parsing (actions are different types of vroom lines)."""
 import vroom
 import vroom.controls
@@ -13,15 +15,20 @@ ACTION = vroom.Specification(
     MESSAGE='message',
     SYSTEM='system',
     HIJACK='hijack',
-    OUTPUT='output')
+    OUTPUT='output',
+    MACRO='macro')
 
 DIRECTIVE = vroom.Specification(
     CLEAR='clear',
     END='end',
     MESSAGES='messages',
-    SYSTEM='system')
+    SYSTEM='system',
+    MACRO='macro',
+    ENDMACRO='endmacro',
+    DO='do')
 
 DIRECTIVE_PREFIX = '  @'
+ENDMACRO = DIRECTIVE_PREFIX + DIRECTIVE.ENDMACRO
 EMPTY_LINE_CHECK = '  &'
 
 # The number of blank lines that equate to a @clear command.
@@ -53,7 +60,7 @@ CONTROLLED_LINE_TYPES = {
 }
 
 
-def ActionLine(line):
+def ActionLine(line, state=None):
   """Parses a single action line of a vroom file.
 
   >>> ActionLine('This is a comment.')
@@ -80,6 +87,30 @@ def ActionLine(line):
   Traceback (most recent call last):
     ...
   ParseError: Unrecognized directive "nope"
+  >>> state = ParseState([])
+  >>> ActionLine('  @macro (abc)', state)
+  ('macro', None, None)
+  >>> state.lineno += 1 # need to update the state lineno
+  >>> ActionLine('  > iHello, world!<ESC> (2s)', state)
+  ('macro', None, None)
+  >>> state.lineno += 1
+  >>> ActionLine('  :wqa', state)
+  ('macro', None, None)
+  >>> state.lineno += 1
+  >>> ActionLine('  % Hello, world!', state)
+  ('macro', None, None)
+  >>> ActionLine('  @endmacro', state)
+  ('macro', None, None)
+  >>> state.lines
+  deque([])
+  >>> ActionLine('  @do (abc)', state)
+  ('macro', None, None)
+  >>> state.next_line() # macro lines are added to the front of the queue
+  ('  > iHello, world!<ESC> (2s)', 0)
+  >>> state.next_line()
+  ('  :wqa', 1)
+  >>> state.next_line()
+  ('  % Hello, world!', 2)
   >>> ActionLine('  & Output!')  # doctest: +ELLIPSIS
   ('output', 'Output!', ...)
   >>> ActionLine('  Simpler output!')  # doctest: +ELLIPSIS
@@ -87,6 +118,7 @@ def ActionLine(line):
 
   Args:
     line: The line (string)
+    state: The parse state
   Returns:
     (ACTION, line, controls) where line is the original line with the newline,
         action prefix ('  > ', etc.) and control block removed, and controls is
@@ -94,6 +126,11 @@ def ActionLine(line):
   Raises:
     vroom.ParseError
   """
+
+  if state and state.macro_name and not line.startswith(ENDMACRO):
+    state.macros[state.macro_name].append((line, state.lineno))
+    return (ACTION.MACRO, None, None)
+
   line = line.rstrip('\n')
 
   # PASS is different from COMMENT in that PASS breaks up output blocks,
@@ -138,6 +175,23 @@ def ActionLine(line):
     elif directive == DIRECTIVE.SYSTEM:
       return (ACTION.DIRECTIVE, directive, Controls(
           (vroom.controls.OPTION.SYSTEM_STRICTNESS,)))
+    elif directive == DIRECTIVE.MACRO:
+      if state.macro_name:
+        raise vroom.ParseError("Nested macro definitions aren't allowed")
+      state.macro_name = controls
+      state.macro_lineno = state.lineno
+      state.macros[state.macro_name] = []
+      return (ACTION.MACRO, None, None)
+    elif directive == DIRECTIVE.ENDMACRO:
+      if not state.macro_name:
+        raise vroom.ParseError('Not defining a macro')
+      state.macros[state.macro_name] = Macro(state.macros[state.macro_name])
+      state.macro_name = None
+      return (ACTION.MACRO, None, None)
+    elif directive == DIRECTIVE.DO:
+      name = controls
+      state.lines.extendleft(state.macros[name].expand())
+      return (ACTION.MACRO, None, None)
     # Non-controlled directives should be parsed before SplitLineControls.
     raise vroom.ParseError('Unrecognized directive "%s"' % directive)
 
@@ -173,14 +227,22 @@ def Parse(lines):
   """
   pending = None
   pass_count = 0
-  for (lineno, line) in enumerate(lines):
+  state = ParseState(lines)
+
+  while state.lines:
+    line, lineno = state.next_line()
+    # ensure the state lineno always matches the real lineno(so it is restored
+    # after a @do directive
+    state.lineno = lineno
     try:
-      (linetype, line, control) = ActionLine(line)
+      (linetype, line, control) = ActionLine(line, state)
     # Add line number context to all parse errors.
     except vroom.ParseError as e:
       e.SetLineNumber(lineno)
       raise
     # Ignore comments during vroom execution.
+    if linetype == ACTION.MACRO:
+      continue
     if linetype == ACTION.COMMENT:
       # Comments break blank-line combos.
       pass_count = 0
@@ -217,3 +279,32 @@ def Parse(lines):
   # Flush out any actions still in the queue.
   if pending:
     yield pending
+  if state.macro_name:
+    e = vroom.ParseError('Unfinished macro "%s"' % state.macro_name)
+    e.SetLineNumber(state.macro_lineno)
+    raise e
+
+
+class ParseState(object):
+  def __init__(self, lines):
+    self.macro_name = None
+    self.macros = {}
+    self.lineno = -1
+    self.lines = collections.deque((line, lineno) for lineno, line in \
+                                   enumerate(lines))
+
+  def next_line(self):
+    self.lineno += 1
+    return self.lines.popleft()
+
+
+class Macro(object):
+  def __init__(self, lines):
+    self.lines = lines
+    self.lines.reverse()
+
+
+  def expand(self):
+    for line in self.lines:
+      yield line
+
